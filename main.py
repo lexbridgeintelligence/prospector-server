@@ -8,7 +8,6 @@ import re
 
 app = FastAPI()
 
-# Allow all origins so the browser tool can call this server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,6 +34,13 @@ AVG_VALUES = {
     "laser": 2800, "aesthetics": 1200, "ortho": 4500, "weight": 8000, "custom": 3000,
 }
 
+# ── Models defined BEFORE they are used ──────────────────────────────────────
+
+class SearchRequest(BaseModel):
+    niche: str = "hair"
+    location: str = "London, UK"
+    maxResults: int = 20
+
 class EnrichRequest(BaseModel):
     name: str
     area: str
@@ -43,41 +49,7 @@ class EnrichRequest(BaseModel):
     leakageSignals: list = []
     niche: str = "hair"
 
-@app.post("/enrich")
-def enrich(req: EnrichRequest):
-    prompt = f"""You are a revenue intelligence analyst for Lexbridge Intelligence.
-
-Analyse this UK private clinic and identify their specific revenue leakage pattern.
-
-Business: {req.name}
-Location: {req.area}
-Rating: {req.rating} ({req.reviewCount} reviews)
-Leakage Signals: {', '.join(req.leakageSignals)}
-Niche: {NICHE_LABELS.get(req.niche, 'private clinic')}
-
-Output exactly three short paragraphs with these labels:
-LEAKAGE TYPE: (their most likely revenue leakage — be specific to their size and location)
-REVENUE AT RISK: (conservative monthly estimate in £, based on avg procedure value £{AVG_VALUES.get(req.niche, 3000):,})
-OPENING QUESTION: (one question for Terry to open the call with that makes them identify the problem themselves)
-
-Keep each under 2 sentences. Be specific. Never mention AI, chatbots, or software."""
-
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            text += block.text
-
-    return {"success": True, "analysis": text}
-
-    niche: str = "hair"
-    location: str = "London, UK"
-    maxResults: int = 20
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -91,9 +63,9 @@ def search(req: SearchRequest):
 
     prompt = f"""Search the web for real "{niche_label}" businesses in "{req.location}" UK.
 
-Find up to {req.maxResults} REAL businesses that actually exist. Use web search to find them.
+Find up to {req.maxResults} REAL businesses that actually exist.
 
-For each business return a JSON array with this exact structure:
+Return a JSON array only, no other text:
 [
   {{
     "name": "Full clinic name",
@@ -108,17 +80,9 @@ For each business return a JSON array with this exact structure:
   }}
 ]
 
-leakageSignals — pick 2-4 that apply:
-- "No WhatsApp" (if no WhatsApp contact visible)
-- "Web form only" (contact is only via form, not phone/WhatsApp)  
-- "No after-hours response" (no indication of out-of-hours coverage)
-- "No online booking" (no book now button)
-- "Phone only" (old-fashioned contact method only)
-- "Limited hours" (9-5 only, no weekend)
-- "Single coordinator likely" (small solo practice)
+leakageSignals pick 2-4 from: "No WhatsApp", "Web form only", "No after-hours response", "No online booking", "Phone only", "Limited hours", "Single coordinator likely"
 
-Return ONLY the JSON array. No other text. No markdown. No explanation.
-Find real businesses that genuinely exist — do not make up names."""
+Return ONLY the JSON array. No markdown. No explanation."""
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
@@ -127,13 +91,11 @@ Find real businesses that genuinely exist — do not make up names."""
         messages=[{"role": "user", "content": prompt}]
     )
 
-    # Extract text from response
     raw = ""
     for block in response.content:
         if hasattr(block, "text"):
             raw += block.text
 
-    # Parse JSON array from response
     match = re.search(r'\[[\s\S]*\]', raw)
     if not match:
         return {"success": False, "error": "No clinic data found", "businesses": []}
@@ -143,7 +105,6 @@ Find real businesses that genuinely exist — do not make up names."""
     except json.JSONDecodeError:
         return {"success": False, "error": "Failed to parse clinic data", "businesses": []}
 
-    # Enrich each clinic with scoring data
     businesses = []
     for c in clinics:
         leakage = c.get("leakageSignals", [])
@@ -157,11 +118,14 @@ Find real businesses that genuinely exist — do not make up names."""
 
         estimated_loss = len(leakage) * avg_value * 2
 
+        website = c.get("website") or ""
+        domain = website.replace("https://","").replace("http://","").replace("www.","").split("/")[0]
+
         businesses.append({
             "name": c.get("name", "Unknown Clinic"),
             "area": c.get("area", city),
             "phone": c.get("phone") or "Check website",
-            "email": f"info@{c['website'].replace('https://','').replace('http://','').replace('www.','').split('/')[0]}" if c.get("website") else "Check website",
+            "email": f"info@{domain}" if domain else "Check website",
             "website": c.get("website"),
             "hasWebsite": bool(c.get("website")),
             "hasWhatsApp": c.get("hasWhatsApp", False),
@@ -177,3 +141,35 @@ Find real businesses that genuinely exist — do not make up names."""
         })
 
     return {"success": True, "businesses": businesses, "count": len(businesses)}
+
+@app.post("/enrich")
+def enrich(req: EnrichRequest):
+    prompt = f"""You are a revenue intelligence analyst for Lexbridge Intelligence.
+
+Analyse this UK private clinic and identify their specific revenue leakage pattern.
+
+Business: {req.name}
+Location: {req.area}
+Rating: {req.rating} ({req.reviewCount} reviews)
+Leakage Signals: {', '.join(req.leakageSignals)}
+Niche: {NICHE_LABELS.get(req.niche, 'private clinic')}
+
+Output exactly three short paragraphs:
+LEAKAGE TYPE: (their most likely revenue leakage)
+REVENUE AT RISK: (conservative monthly estimate in £)
+OPENING QUESTION: (one question for Terry to open the call with)
+
+Keep each under 2 sentences. Never mention AI, chatbots, or software."""
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    return {"success": True, "analysis": text}
