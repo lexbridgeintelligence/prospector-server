@@ -52,6 +52,25 @@ class AuditRequest(BaseModel):
     url: str
     bizName: str = ""
 
+class LinkedinFinderRequest(BaseModel):
+    name: str
+    area: str = ""
+    niche: str = "hair"
+    website: str = ""
+
+class LinkedinDmRequest(BaseModel):
+    name: str
+    area: str = ""
+    niche: str = "hair"
+    leakageSignals: list = []
+    estimatedMonthlyLoss: int = 5000
+    decisionMakerName: str = ""
+    decisionMakerTitle: str = ""
+
+class LinkedinContentRequest(BaseModel):
+    angle: str = "case_study"
+    count: int = 3
+
 @app.get("/health")
 def health():
     return {"status": "ok", "live": True}
@@ -100,6 +119,56 @@ def audit(req: AuditRequest):
         match = re.search(r'\{[\s\S]*\}', raw)
         if match:
             return {"success": True, "audit": json.loads(match.group(0))}
+        return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
+    except Exception as e:
+        return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
+
+@app.post("/linkedin-finder")
+def linkedin_finder(req: LinkedinFinderRequest):
+    niche_label = NICHE_LABELS.get(req.niche, "private clinic")
+    prompt = f"""Search the web (including LinkedIn public results) to identify the most likely decision-maker at this UK {niche_label}.\n\nBusiness: {req.name}\nArea: {req.area}\nWebsite: {req.website or "unknown"}\n\nLook for the owner, founder, practice manager, or clinical director — whoever would actually see and act on a business message. Use public sources only (LinkedIn search results, the clinic website's About/Team page, Companies House).\n\nReturn ONLY this JSON structure:\n{{\n  "likelyName": "Full name or null if not found",\n  "likelyTitle": "Their role e.g. Practice Manager, Owner, Clinical Director",\n  "linkedinSearchUrl": "https://www.linkedin.com/search/results/people/?keywords=URL_ENCODED_NAME_AND_CLINIC",\n  "confidence": "high, medium, or low",\n  "reasoning": "One sentence on how you identified them or why confidence is low."\n}}\n\nReturn ONLY valid JSON. No markdown, no explanation."""
+    try:
+        response = client.messages.create(model="claude-sonnet-4-6", max_tokens=800, tools=[{"type": "web_search_20250305", "name": "web_search"}], messages=[{"role": "user", "content": prompt}])
+        raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return {"success": True, "decisionMaker": json.loads(match.group(0))}
+        return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
+    except Exception as e:
+        return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
+
+@app.post("/linkedin-dm")
+def linkedin_dm(req: LinkedinDmRequest):
+    niche_label = NICHE_LABELS.get(req.niche, "private clinic")
+    who = f"{req.decisionMakerName} ({req.decisionMakerTitle})" if req.decisionMakerName else "the clinic's decision-maker"
+    prompt = f"""You are writing LinkedIn outreach for Terry, founder of Lexbridge Intelligence — a revenue intelligence platform for UK private elective healthcare clinics.\n\nTarget: {who} at {req.name}, a {niche_label} in {req.area}.\nRevenue leakage signals found: {', '.join(req.leakageSignals) or "general enquiry handling gaps"}\nEstimated monthly revenue at risk: £{req.estimatedMonthlyLoss:,}\n\nWrite a LinkedIn outreach sequence:\n1. A connection request note (max 300 characters, no pitch, just a genuine reason to connect referencing something specific about their clinic)\n2. A first follow-up DM sent after they accept (short, curious, asks one question about their enquiry handling — no pitch)\n3. A second follow-up DM for if there's no reply after 4-5 days (references the specific £ figure, offers the free audit, low pressure)\n\nTone: peer-to-peer, direct, zero hype, never mentions "AI" or "software" or "bot". Terry is a person reaching out to another person.\n\nReturn ONLY this JSON:\n{{\n  "connectionRequest": "...",\n  "followUp1": "...",\n  "followUp2": "..."\n}}\n\nReturn ONLY valid JSON. No markdown, no explanation."""
+    try:
+        response = client.messages.create(model="claude-sonnet-4-6", max_tokens=900, messages=[{"role": "user", "content": prompt}])
+        raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return {"success": True, "messages": json.loads(match.group(0))}
+        return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
+    except Exception as e:
+        return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
+
+CONTENT_ANGLES = {
+    "case_study": "an anonymized case study — describe a pattern you've seen across clinics (e.g. a clinic losing £X/month to slow after-hours response) without naming any real business",
+    "industry_stat": "a sharp industry-commentary post using a striking statistic or pattern about UK private healthcare enquiry handling",
+    "controversial_take": "a mildly contrarian, opinionated take that challenges how private clinics think about marketing spend vs. enquiry handling",
+    "behind_the_scenes": "a behind-the-scenes post about building Lexbridge Intelligence and what founders in this space don't talk about",
+}
+
+@app.post("/linkedin-content")
+def linkedin_content(req: LinkedinContentRequest):
+    angle_desc = CONTENT_ANGLES.get(req.angle, CONTENT_ANGLES["case_study"])
+    prompt = f"""You are ghostwriting LinkedIn posts for Terry, founder of Lexbridge Intelligence — a revenue intelligence platform that shows UK private healthcare clinics (starting with hair transplant clinics) exactly how much revenue they're losing to slow or missed enquiries, and recovers it.\n\nWrite {req.count} distinct LinkedIn posts, each {angle_desc}.\n\nEach post should:\n- Open with a hook line that stops the scroll (short, punchy, first line stands alone)\n- Be 80-150 words, short paragraphs, no corporate jargon\n- Build Terry's authority as the person who understands revenue leakage in private healthcare\n- End with a soft, non-salesy close (a question, a thought, not a hard CTA)\n- Never use the words "AI", "chatbot", "software", or "bot" — Terry talks about the problem and the numbers, not the tech\n\nReturn ONLY this JSON:\n{{\n  "posts": [\n    {{"hook": "First line", "body": "Full post text including the hook", "angle": "{req.angle}"}}\n  ]\n}}\n\nReturn ONLY valid JSON. No markdown, no explanation."""
+    try:
+        response = client.messages.create(model="claude-sonnet-4-6", max_tokens=2000, messages=[{"role": "user", "content": prompt}])
+        raw = "".join(block.text for block in response.content if hasattr(block, "text"))
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return {"success": True, "posts": json.loads(match.group(0)).get("posts", [])}
         return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
     except Exception as e:
         return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
