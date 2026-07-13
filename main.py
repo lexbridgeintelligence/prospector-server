@@ -5,6 +5,7 @@ import anthropic
 import os
 import json
 import re
+import traceback
 
 app = FastAPI()
 
@@ -101,4 +102,4 @@ def audit(req: AuditRequest):
             return {"success": True, "audit": json.loads(match.group(0))}
         return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
