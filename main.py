@@ -115,14 +115,28 @@ def enrich(req: EnrichRequest):
 
 @app.post("/audit")
 def audit(req: AuditRequest):
-    prompt = f"""You are a revenue intelligence analyst for Lexbridge Intelligence. Audit this UK hair transplant clinic website and identify where they are losing revenue.\n\nURL: {req.url}\nClinic: {req.bizName}\n\nSearch the web for this clinic. Then return ONLY this exact JSON structure:\n{{\n  "overallScore": 45,\n  "revenueAtRisk": "£28,000-£42,000",\n  "primaryLeakage": "After-hours enquiry gap",\n  "responseSpeedRisk": "Specific finding about their response speed based on their contact options.",\n  "followUpInfrastructure": "Specific finding about their follow-up systems.",\n  "leakageEstimate": "Conservative monthly revenue at risk calculation.",\n  "lexbridgePitch": "Three sentences Terry can use referencing something specific from this clinic website.",\n  "recommendedTier": "Intelligence",\n  "tierPrice": "£749/mo (60-day free trial)",\n  "keyFindings": ["Finding 1", "Finding 2", "Finding 3", "Finding 4"],\n  "sections": {{\n    "responseSpeed": {{"score": 30, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "followUp": {{"score": 25, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "booking": {{"score": 50, "status": "warn", "findings": [{{"status": "warn", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "afterHours": {{"score": 20, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}}\n  }},\n  "priorityFixes": [\n    {{"rank": 1, "title": "Fix title", "description": "Description", "value": "£X,000/month"}},\n    {{"rank": 2, "title": "Fix title", "description": "Description", "value": "£X,000/month"}},\n    {{"rank": 3, "title": "Fix title", "description": "Description", "value": "£X,000/month"}}\n  ]\n}}\n\nBe specific to THIS clinic. Return ONLY valid JSON."""
+    prompt = f"""You are a revenue intelligence analyst for Lexbridge Intelligence. Audit this UK hair transplant clinic website and identify where they are losing revenue.\n\nURL: {req.url}\nClinic: {req.bizName}\n\nSearch the web for this clinic. Then return ONLY this exact JSON structure:\n{{\n  "overallScore": 45,\n  "revenueAtRisk": "£28,000-£42,000",\n  "primaryLeakage": "After-hours enquiry gap",\n  "responseSpeedRisk": "Specific finding about their response speed based on their contact options.",\n  "followUpInfrastructure": "Specific finding about their follow-up systems.",\n  "leakageEstimate": "Conservative monthly revenue at risk calculation.",\n  "lexbridgePitch": "Three sentences Terry can use referencing something specific from this clinic website.",\n  "recommendedTier": "Intelligence",\n  "tierPrice": "£749/mo (60-day free trial)",\n  "keyFindings": ["Finding 1", "Finding 2", "Finding 3", "Finding 4"],\n  "sections": {{\n    "responseSpeed": {{"score": 30, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "followUp": {{"score": 25, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "booking": {{"score": 50, "status": "warn", "findings": [{{"status": "warn", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}},\n    "afterHours": {{"score": 20, "status": "fail", "findings": [{{"status": "fail", "label": "Label", "detail": "Detail", "impact": "£X,000/month"}}]}}\n  }},\n  "priorityFixes": [\n    {{"rank": 1, "title": "Fix title", "description": "Description", "value": "£X,000/month"}},\n    {{"rank": 2, "title": "Fix title", "description": "Description", "value": "£X,000/month"}},\n    {{"rank": 3, "title": "Fix title", "description": "Description", "value": "£X,000/month"}}\n  ]\n}}\n\nBe specific to THIS clinic. Never use a double-quote character inside any string value — if you need to quote or reference specific wording from the site, paraphrase it instead of quoting it directly. Return ONLY valid JSON."""
     try:
-        response = client.messages.create(model="claude-sonnet-4-6", max_tokens=2000, tools=[{"type": "web_search_20250305", "name": "web_search"}], messages=[{"role": "user", "content": prompt}])
+        response = client.messages.create(model="claude-sonnet-4-6", max_tokens=3000, tools=[{"type": "web_search_20250305", "name": "web_search"}], messages=[{"role": "user", "content": prompt}])
         raw = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
         match = re.search(r'\{[\s\S]*\}', raw)
-        if match:
-            return {"success": True, "audit": json.loads(match.group(0))}
-        return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
+        if not match:
+            return {"success": False, "error": "Could not parse response", "raw": raw[:300]}
+        json_str = match.group(0)
+        try:
+            return {"success": True, "audit": json.loads(json_str)}
+        except json.JSONDecodeError:
+            # Retry once with a lightweight repair pass: normalize smart quotes and
+            # strip stray control characters that occasionally break the model's
+            # own JSON output when a string value contains an embedded quote.
+            repaired = (json_str
+                        .replace("“", "'").replace("”", "'")
+                        .replace("‘", "'").replace("’", "'"))
+            repaired = re.sub(r'[\x00-\x1f]+', ' ', repaired)
+            try:
+                return {"success": True, "audit": json.loads(repaired)}
+            except json.JSONDecodeError as e2:
+                return {"success": False, "error": f"JSON parse failed after repair: {e2}", "raw": json_str[:500]}
     except Exception as e:
         return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
 
