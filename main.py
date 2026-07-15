@@ -39,6 +39,7 @@ class SearchRequest(BaseModel):
     niche: str = "hair"
     location: str = "London, UK"
     maxResults: int = 20
+    sources: list = []
 
 class EnrichRequest(BaseModel):
     name: str
@@ -80,7 +81,44 @@ def search(req: SearchRequest):
     niche_label = NICHE_LABELS.get(req.niche, "private clinic")
     avg_value = AVG_VALUES.get(req.niche, 3000)
     city = req.location.split(",")[0].strip()
-    prompt = f"""Search the web for real "{niche_label}" businesses in "{req.location}" UK. Find up to {req.maxResults} REAL businesses. Return a JSON array only:\n[\n  {{\n    "name": "Full clinic name",\n    "area": "{city}",\n    "phone": "phone number or null",\n    "website": "full URL or null",\n    "rating": 4.2,\n    "reviewCount": 87,\n    "hasWhatsApp": false,\n    "hasWebsite": true,\n    "leakageSignals": ["No WhatsApp", "Web form only"]\n  }}\n]\nleakageSignals pick 2-4 from: "No WhatsApp", "Web form only", "No after-hours response", "No online booking", "Phone only", "Limited hours", "Single coordinator likely"\nReturn ONLY the JSON array. No markdown. No explanation."""
+    source_labels = {
+        "google_maps": "Google Maps / Google Business listings",
+        "linkedin": "LinkedIn company pages",
+        "yell": "Yell / Thomson local directories",
+        "company_site": "the businesses' own websites",
+        "facebook": "Facebook Business pages",
+        "instagram": "Instagram Business profiles",
+    }
+    chosen_sources = [source_labels[s] for s in (req.sources or []) if s in source_labels]
+    source_hint = (
+        f"\nLean toward finding businesses that are discoverable via: {', '.join(chosen_sources)}. This is a bias, not a hard requirement — still prioritize finding REAL businesses over strict source matching.\n"
+        if chosen_sources else ""
+    )
+    prompt = f"""Search the web for real "{niche_label}" businesses in "{req.location}" UK. Find up to {req.maxResults} REAL, DIFFERENT businesses — do not repeat the same business twice.
+{source_hint}
+
+For EACH business, actually look at its real Google Business listing and, where you can find it, its real website — do not guess or default to a generic answer. Businesses genuinely differ from each other: some have WhatsApp and online booking, some don't, some have 400 reviews, some have 12. Your job is to reflect those real, individual differences, not to describe every clinic the same way.
+
+Return a JSON array only:
+[
+  {{
+    "name": "Full clinic name",
+    "area": "{city}",
+    "phone": "phone number or null",
+    "website": "full URL or null",
+    "rating": 4.2,
+    "reviewCount": 87,
+    "hasWhatsApp": false,
+    "hasWebsite": true,
+    "leakageSignals": ["No WhatsApp", "Web form only"]
+  }}
+]
+
+leakageSignals: choose ONLY the ones you found real evidence for, from this list: "No WhatsApp", "Web form only", "No after-hours response", "No online booking", "Phone only", "Limited hours", "Single coordinator likely". It is normal and expected for this list to vary in length business to business — some businesses may have 0-1 signals (well set up), others may have 4+ (badly set up). Do NOT give every business the same combination.
+
+rating and reviewCount must be the real, current values for each specific business — these should differ business to business, not cluster around one number.
+
+Return ONLY the JSON array. No markdown. No explanation."""
     try:
         response = client.messages.create(model="claude-sonnet-4-6", max_tokens=4000, tools=[{"type": "web_search_20250305", "name": "web_search"}], messages=[{"role": "user", "content": prompt}])
         raw = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
@@ -91,18 +129,53 @@ def search(req: SearchRequest):
             clinics = json.loads(match.group(0))
         except json.JSONDecodeError:
             return {"success": False, "error": "Failed to parse", "businesses": []}
+
+        # Per-signal weights so the score/loss reflect WHICH gaps a business has,
+        # not just how many — this is what makes two businesses with the same
+        # signal count still land on different numbers.
+        SIGNAL_WEIGHTS = {
+            "No after-hours response": 14,
+            "No WhatsApp": 12,
+            "Web form only": 10,
+            "No online booking": 9,
+            "Phone only": 8,
+            "Limited hours": 7,
+            "Single coordinator likely": 6,
+        }
+
+        avg_value = AVG_VALUES.get(req.niche, 3000)
         businesses = []
         for c in clinics:
-            leakage = c.get("leakageSignals", [])
-            score = 50
-            if not c.get("hasWhatsApp", True): score += 15
-            if "Web form only" in leakage: score += 12
-            if "No after-hours response" in leakage: score += 10
-            if "No online booking" in leakage: score += 8
-            if c.get("reviewCount", 0) > 100: score += 10
+            leakage = c.get("leakageSignals", []) or []
+            rating = c.get("rating", 4.0) or 4.0
+            review_count = c.get("reviewCount", 20) or 20
+            signal_weight = sum(SIGNAL_WEIGHTS.get(s, 5) for s in leakage)
+
+            # Score: base + weighted signals + rating/volume modifiers, spread
+            # across a real range instead of a handful of fixed step values.
+            score = 38 + signal_weight
+            if review_count > 200: score += 10
+            elif review_count > 100: score += 6
+            elif review_count > 40: score += 3
+            if rating < 3.8: score += 8
+            elif rating < 4.3: score += 3
+            score = min(max(round(score), 32), 96)
+
+            # Monthly loss: scale the niche average by how busy the business
+            # actually is (review count as a proxy for enquiry volume) and by
+            # how severe its specific gaps are — not just a flat signal count.
+            if review_count > 200: size_mult = 1.7
+            elif review_count > 100: size_mult = 1.35
+            elif review_count > 40: size_mult = 1.0
+            elif review_count > 15: size_mult = 0.8
+            else: size_mult = 0.6
+            severity = 0.35 + min(signal_weight, 45) / 45 * 0.9
+            est_loss = avg_value * size_mult * severity
+            est_loss = max(round(est_loss / 50) * 50, 300)
+
             website = c.get("website") or ""
             domain = website.replace("https://","").replace("http://","").replace("www.","").split("/")[0]
-            businesses.append({"name": c.get("name","Unknown Clinic"), "area": c.get("area", city), "phone": c.get("phone") or "Check website", "email": f"info@{domain}" if domain else "Check website", "website": c.get("website"), "hasWebsite": bool(c.get("website")), "hasWhatsApp": c.get("hasWhatsApp", False), "rating": c.get("rating", 4.0), "reviewCount": c.get("reviewCount", 20), "leakageSignals": leakage, "score": min(score, 95), "estimatedMonthlyLoss": len(leakage) * AVG_VALUES.get(req.niche, 3000) * 2, "sources": ["Live Google Search"], "status": "new", "contacted": False, "isRealData": True})
+            businesses.append({"name": c.get("name","Unknown Clinic"), "area": c.get("area", city), "phone": c.get("phone") or "Check website", "email": f"info@{domain}" if domain else "Check website", "website": c.get("website"), "hasWebsite": bool(c.get("website")), "hasWhatsApp": c.get("hasWhatsApp", False), "rating": rating, "reviewCount": review_count, "leakageSignals": leakage, "score": score, "estimatedMonthlyLoss": int(est_loss), "sources": ["Live Google Search"], "status": "new", "contacted": False, "isRealData": True})
         return {"success": True, "businesses": businesses, "count": len(businesses)}
     except Exception as e:
         return {"success": False, "error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc(), "businesses": []}
